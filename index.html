@@ -1,0 +1,901 @@
+// Gatewise - ticketing and door entry
+// Drop this in place of the <script> block in the HTML page.
+
+// ---- config ----
+const APP_NAME = 'Gatewise';
+// put your Firebase web config here. leave apiKey empty and it runs in demo mode
+const FIREBASE_CONFIG = { apiKey: '', authDomain: '', projectId: '', appId: '' };
+const UPGRADE_URL = 'mailto:sales@yourdomain.com?subject=Upgrade';
+const PLANS = {
+  free: { name: 'Free', maxEvents: 1, maxTickets: 100 },
+  pro: { name: 'Pro', maxEvents: 99, maxTickets: 5000 },
+};
+
+// ---- helpers ----
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => document.querySelectorAll(sel);
+
+const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ESC[c]);
+}
+
+function formatDate(ts) {
+  if (!ts) return '';
+  return new Date(ts).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+// date + venue, skipping whichever is missing
+function eventMeta(ev) {
+  return [formatDate(ev.date), ev.venue].filter(Boolean);
+}
+
+// no i, l, o, 0, 1 so codes are easy to read out over the phone
+const ID_CHARS = 'abcdefghjkmnpqrstuvwxyz23456789';
+function randomId(len) {
+  const bytes = new Uint8Array(len);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => ID_CHARS[b % ID_CHARS.length]).join('');
+}
+
+// the short code on a ticket is just the last 6 chars of its id
+const shortCode = (id) => id.slice(-6).toUpperCase();
+const isValidEmail = (s) => /^\S+@\S+\.\S+$/.test(s);
+
+function saveFile(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+let toastTimer;
+function showToast(msg) {
+  const box = $('#msg');
+  box.textContent = msg;
+  box.style.display = msg ? 'block' : 'none';
+  clearTimeout(toastTimer);
+  if (msg) toastTimer = setTimeout(() => (box.style.display = 'none'), 5000);
+}
+
+document.title = APP_NAME;
+$$('.bn').forEach((el) => (el.textContent = APP_NAME));
+$('#lg').textContent = APP_NAME.charAt(0);
+
+
+// ============================================================
+// Data layer
+// Firebase and the demo backend have the same methods, so the
+// rest of the app doesn't care which one it's using.
+// ============================================================
+
+const FirebaseBackend = {
+  init() {
+    firebase.initializeApp(FIREBASE_CONFIG);
+    this.auth = firebase.auth();
+    this.db = firebase.firestore();
+  },
+  onAuthChange(cb) {
+    this.auth.onAuthStateChanged((u) => cb(u && { uid: u.uid, email: u.email }));
+  },
+  signIn: (email, pw) => FirebaseBackend.auth.signInWithEmailAndPassword(email, pw),
+  signUp: (email, pw) => FirebaseBackend.auth.createUserWithEmailAndPassword(email, pw),
+  signOut: () => FirebaseBackend.auth.signOut(),
+  resetPassword: (email) => FirebaseBackend.auth.sendPasswordResetEmail(email),
+
+  getDoc(path) {
+    return this.db.doc(path).get().then((snap) => (snap.exists ? snap.data() : null));
+  },
+  setDoc: (path, data) => FirebaseBackend.db.doc(path).set(data),
+  updateDoc: (path, data) => FirebaseBackend.db.doc(path).update(data),
+  deleteDoc: (path) => FirebaseBackend.db.doc(path).delete(),
+
+  // `where` is an optional [field, value] pair. returns an unsubscribe function
+  watchCollection(path, cb, where) {
+    let q = this.db.collection(path);
+    if (where) q = q.where(where[0], '==', where[1]);
+    return q.onSnapshot(
+      (snap) => cb(snap.docs.map((d) => ({ ...d.data(), id: d.id }))),
+      (err) => showToast(err.message)
+    );
+  },
+
+  // transaction, so two scanners can't both let the same ticket in
+  claimTicket(path) {
+    const ref = this.db.doc(path);
+    const scannedBy = this.auth.currentUser.email;
+    return this.db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return { status: 'missing' };
+      const data = snap.data();
+      if (data.used) return { status: 'used', data };
+      tx.update(ref, { used: true, usedAt: Date.now(), usedBy: scannedBy });
+      return { status: 'valid', data };
+    });
+  },
+};
+
+// demo backend: all in localStorage, none of it real
+let demoDb = {};
+try {
+  demoDb = JSON.parse(localStorage.getItem('gw_demo') || '{}') || {};
+} catch (e) {
+  demoDb = {};   // blocked or corrupted storage, start fresh
+}
+let demoListeners = [];
+
+function saveDemoDb() {
+  try {
+    localStorage.setItem('gw_demo', JSON.stringify(demoDb));
+  } catch (e) {
+    // storage full or blocked, demo still works until the page is closed
+  }
+  demoListeners.slice().forEach((fn) => fn());
+}
+
+const DemoBackend = {
+  onAuthChange(cb) {
+    this.notifyAuth = cb;
+    cb(demoDb._session || null);
+  },
+  signIn(email, pw) {
+    const acc = (demoDb._accounts || {})[email];
+    if (!acc || acc.password !== pw) return Promise.reject();
+    demoDb._session = { uid: acc.uid, email };
+    saveDemoDb();
+    this.notifyAuth(demoDb._session);
+    return Promise.resolve();
+  },
+  signUp(email, pw) {
+    demoDb._accounts = demoDb._accounts || {};
+    if (demoDb._accounts[email]) {
+      return Promise.reject({ message: 'This email already has an account.' });
+    }
+    demoDb._accounts[email] = { password: pw, uid: randomId(12) };
+    return this.signIn(email, pw);
+  },
+  signOut() {
+    demoDb._session = null;
+    saveDemoDb();
+    this.notifyAuth(null);
+    return Promise.resolve();
+  },
+  resetPassword: () => Promise.reject({ message: 'Not available in demo mode.' }),
+
+  getDoc: (path) => Promise.resolve(demoDb[path] ? JSON.parse(JSON.stringify(demoDb[path])) : null),
+  setDoc(path, data) {
+    demoDb[path] = data;
+    saveDemoDb();
+    return Promise.resolve();
+  },
+  updateDoc(path, data) {
+    demoDb[path] = { ...demoDb[path], ...data };
+    saveDemoDb();
+    return Promise.resolve();
+  },
+  deleteDoc(path) {
+    delete demoDb[path];
+    saveDemoDb();
+    return Promise.resolve();
+  },
+
+  watchCollection(path, cb, where) {
+    let active = true;
+    const emit = () => {
+      if (!active) return;
+      // direct children only: "a/b/x" is in "a/b", "a/b/x/y" is not
+      const docs = Object.keys(demoDb)
+        .filter((key) => {
+          if (key.indexOf(path + '/') !== 0) return false;
+          if (key.slice(path.length + 1).indexOf('/') >= 0) return false;
+          return !where || demoDb[key][where[0]] === where[1];
+        })
+        .map((key) => ({ ...demoDb[key], id: key.slice(path.length + 1) }));
+      cb(docs);
+    };
+    demoListeners.push(emit);
+    emit();
+    return () => {
+      active = false;
+      const i = demoListeners.indexOf(emit);
+      if (i >= 0) demoListeners.splice(i, 1);
+    };
+  },
+
+  claimTicket(path) {
+    const ticket = demoDb[path];
+    if (!ticket) return Promise.resolve({ status: 'missing' });
+    if (ticket.used) return Promise.resolve({ status: 'used', data: ticket });
+    ticket.used = true;
+    ticket.usedAt = Date.now();
+    ticket.usedBy = demoDb._session.email;
+    saveDemoDb();
+    return Promise.resolve({ status: 'valid', data: ticket });
+  },
+};
+
+const isLive = !!(FIREBASE_CONFIG.apiKey && window.firebase);
+
+function seedDemoData() {
+  const now = Date.now();
+  const DAY = 864e5;
+  const names = ['Aarav Sharma', 'Priya Verma', 'Rohan Gupta', 'Sneha Iyer', 'Vikram Singh', 'Ishita Rao',
+    'Kabir Malhotra', 'Diya Kapoor', 'Arjun Nair', 'Meera Joshi', 'Yash Tiwari', 'Tanya Bose'];
+
+  demoDb._accounts = demoDb._accounts || {};
+  demoDb._accounts['demo@gatewise.test'] = { password: 'demo1234', uid: 'demoorg1' };
+  demoDb._accounts['staff@gatewise.test'] = { password: 'demo1234', uid: 'demostaff1' };
+  demoDb['users/demoorg1'] = { orgId: 'demoorg1', role: 'owner', email: 'demo@gatewise.test', name: 'Demo Owner' };
+  demoDb['users/demostaff1'] = { orgId: 'demoorg1', role: 'staff', email: 'staff@gatewise.test', name: 'Demo Staff' };
+  demoDb['orgs/demoorg1'] = { name: 'Starlight Events', plan: 'pro', createdAt: now };
+  demoDb['orgs/demoorg1/events/demoev001'] = { name: 'Neon Night Live', date: now + 5 * DAY, venue: 'Lucknow', color: '#7c3aed', createdAt: now - 2e6 };
+  demoDb['orgs/demoorg1/events/demoev002'] = { name: 'Startup Meetup 2026', date: now + 20 * DAY, venue: 'Delhi', color: '#0f766e', createdAt: now - 1e6 };
+
+  names.forEach((name, i) => {
+    const entered = i % 3 === 0;
+    const t = {
+      name,
+      phone: '+91 98' + (1e8 + i * 7654321).toString().slice(0, 8),
+      email: name.split(' ')[0].toLowerCase() + '@example.com',
+      createdAt: now - (12 - i) * 3e6,
+      used: entered,
+    };
+    if (entered) {
+      t.usedAt = now - (i + 1) * 6e5;
+      t.usedBy = 'staff@gatewise.test';
+    }
+    demoDb['orgs/demoorg1/events/demoev001/tickets/demotk' + ('000' + (i + 1)).slice(-4)] = t;
+  });
+  saveDemoDb();
+}
+
+if (!isLive && !(demoDb._accounts && demoDb._accounts['demo@gatewise.test'])) seedDemoData();
+
+if (isLive) FirebaseBackend.init();
+const db = isLive ? FirebaseBackend : DemoBackend;
+
+
+// ============================================================
+// App state
+// ============================================================
+let user = null;          // { uid, email }
+let profile = null;       // users/{uid}: orgId + role
+let org = null;           // orgs/{orgId}
+let events = [];
+let currentEventId = '';
+let tickets = [];
+let team = [];
+let invites = [];
+let subscriptions = [];   // unsubscribe fns for the org-level listeners
+let ticketSub = null;
+let pendingSignup = {};   // org + name typed on the sign-up form
+let authMode = 'in';
+let loadId = 0;           // bumped on every auth change so old loads can bail out
+
+const currentEvent = () => events.find((e) => e.id === currentEventId) || null;
+const ticketsPath = () => `orgs/${profile.orgId}/events/${currentEventId}/tickets`;
+const currentPlan = () => PLANS[org && org.plan] || PLANS.free;
+const isOwner = () => !!profile && profile.role === 'owner';
+
+
+// ============================================================
+// Auth
+// ============================================================
+const errBox = $('#lErr');
+
+function resetAuthError() {
+  errBox.textContent = '';
+  errBox.style.color = '';
+}
+
+function setAuthMode(mode) {
+  authMode = mode;
+  const up = mode === 'up';
+  $('#m1').classList.toggle('on', !up);
+  $('#m2').classList.toggle('on', up);
+  $('#upf').hidden = !up;
+  $('#jn').hidden = !up;
+  $('#fg').hidden = up;
+  $('#go').textContent = up ? 'Create account' : 'Sign in';
+  $('#at').textContent = up ? 'Start your workspace' : 'Welcome back';
+  $('#as').textContent = up ? 'Free plan, no card needed' : 'Sign in to your workspace';
+  resetAuthError();
+}
+$('#m1').onclick = () => setAuthMode('in');
+$('#m2').onclick = () => setAuthMode('up');
+
+$('#fill').onclick = () => {
+  $('#le').value = 'demo@gatewise.test';
+  $('#lp').value = 'demo1234';
+  setAuthMode('in');
+  $('#go').click();
+};
+
+$('#go').onclick = () => {
+  const email = $('#le').value.trim().toLowerCase();
+  const password = $('#lp').value;
+  resetAuthError();
+
+  if (!isValidEmail(email) || password.length < 6) {
+    errBox.textContent = 'Enter a valid email and a password of 6+ characters.';
+    return;
+  }
+  if (authMode === 'up') {
+    pendingSignup = { org: $('#lo').value.trim(), name: $('#ln').value.trim() };
+  }
+  const attempt = authMode === 'up' ? db.signUp(email, password) : db.signIn(email, password);
+  attempt.catch((e) => {
+    errBox.textContent = e && e.message ? e.message.replace('Firebase: ', '') : 'Wrong email or password.';
+  });
+};
+$('#lp').onkeydown = (e) => { if (e.key === 'Enter') $('#go').click(); };
+
+$('#rs').onclick = (e) => {
+  e.preventDefault();
+  const email = $('#le').value.trim();
+  resetAuthError();
+  if (!email) { errBox.textContent = 'Type your email first.'; return; }
+  db.resetPassword(email)
+    .then(() => {
+      errBox.style.color = 'var(--ok)';
+      errBox.textContent = 'Reset link sent. Check your inbox.';
+    })
+    .catch((err) => (errBox.textContent = err.message));
+};
+$('#so').onclick = () => db.signOut();
+
+function clearSubscriptions() {
+  subscriptions.forEach((unsub) => unsub && unsub());
+  subscriptions = [];
+  if (ticketSub) { ticketSub(); ticketSub = null; }
+  events = []; tickets = []; team = []; invites = [];
+  currentEventId = '';
+}
+
+// first login makes a workspace for the user, unless someone invited their email
+async function loadWorkspace(authUser) {
+  const myLoad = ++loadId;
+  try {
+    let userProfile = await db.getDoc('users/' + authUser.uid);
+
+    if (!userProfile) {
+      const inviteKey = 'invites/' + authUser.email.toLowerCase();
+      const invite = await db.getDoc(inviteKey);
+      if (invite) {
+        userProfile = { orgId: invite.orgId, role: invite.role, email: authUser.email, name: pendingSignup.name || '' };
+      } else {
+        userProfile = { orgId: authUser.uid, role: 'owner', email: authUser.email, name: pendingSignup.name || '' };
+        await db.setDoc('orgs/' + authUser.uid, { name: pendingSignup.org || 'My events', plan: 'free', createdAt: Date.now() });
+      }
+      await db.setDoc('users/' + authUser.uid, userProfile);
+      if (invite) db.deleteDoc(inviteKey).catch(() => {});
+    }
+
+    const orgDoc = (await db.getDoc('orgs/' + userProfile.orgId)) || { name: 'Workspace', plan: 'free' };
+    if (myLoad !== loadId) return;   // user signed out (or in as someone else) while we waited
+
+    user = authUser;
+    profile = userProfile;
+    org = orgDoc;
+
+    $('#auth').hidden = true;
+    $('#app').hidden = false;
+    $('#em').textContent = authUser.email;
+    $('#av').textContent = authUser.email.charAt(0).toUpperCase();
+
+    subscriptions.push(db.watchCollection(`orgs/${profile.orgId}/events`, (list) => {
+      events = list.sort((a, b) => b.createdAt - a.createdAt);
+      if (!currentEvent()) {
+        currentEventId = events[0] ? events[0].id : '';
+        watchTickets();
+      }
+      renderAll();
+    }));
+
+    if (isOwner()) {
+      subscriptions.push(db.watchCollection('users', (list) => { team = list; renderAccount(); }, ['orgId', profile.orgId]));
+      subscriptions.push(db.watchCollection('invites', (list) => { invites = list; renderAccount(); }, ['orgId', profile.orgId]));
+    }
+    showTab('home');
+  } catch (e) {
+    if (myLoad !== loadId) return;
+    showToast('Could not open your workspace: ' + (e.message || e));
+    db.signOut();
+  }
+}
+
+function watchTickets() {
+  if (ticketSub) { ticketSub(); ticketSub = null; }
+  tickets = [];
+  if (!currentEventId) return;
+  ticketSub = db.watchCollection(ticketsPath(), (list) => {
+    tickets = list.sort((a, b) => b.createdAt - a.createdAt);
+    renderAll();
+  });
+}
+
+
+// ============================================================
+// Navigation
+// ============================================================
+const TAB_TITLES = {
+  home: ['Overview', 'Your event at a glance'],
+  issue: ['Issue tickets', 'Create a ticket and send it to the buyer'],
+  guests: ['Guests', 'Everyone who has a ticket'],
+  scan: ['Scan entry', 'Check tickets at the door'],
+  acct: ['Account', 'Workspace, plan and team'],
+};
+
+function showTab(tab) {
+  $$('.tabs button').forEach((b) => b.classList.toggle('on', b.dataset.t === tab));
+  Object.keys(TAB_TITLES).forEach((key) => ($('#' + key).hidden = key !== tab));
+  $('#pt').textContent = TAB_TITLES[tab][0];
+  $('#ps').textContent = TAB_TITLES[tab][1];
+  if (tab !== 'scan') stopCamera();   // don't leave the camera running behind other tabs
+}
+$$('.tabs button').forEach((b) => (b.onclick = () => showTab(b.dataset.t)));
+
+function selectEvent(id) {
+  currentEventId = id;
+  watchTickets();
+  renderAll();
+}
+$('#evs').onchange = function () { selectEvent(this.value); };
+$('#elist').onclick = (e) => {
+  const btn = e.target.closest('[data-e]');
+  if (btn) selectEvent(btn.dataset.e);
+};
+
+
+// ============================================================
+// Rendering
+// ============================================================
+function renderAll() {
+  if (!profile) return;
+  const ev = currentEvent();
+  const total = tickets.length;
+  const entered = tickets.filter((t) => t.used).length;
+  const pct = total ? Math.round((entered / total) * 100) : 0;
+
+  $('#evs').innerHTML =
+    events.map((x) => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.name)}</option>`).join('')
+    || '<option value="">No events</option>';
+  $('#evs').value = currentEventId;
+
+  const banner = $('#bn');
+  banner.style.background = ev ? `linear-gradient(135deg,${ev.color || '#2447e0'},#111827)` : '';
+  banner.innerHTML = ev
+    ? `<span class="pillg">Selected event</span><h2>${escapeHtml(ev.name)}</h2>
+       <p>${eventMeta(ev).map(escapeHtml).join(' · ')}</p>
+       <div class="bar"><i style="width:${pct}%"></i></div>
+       <small style="color:#fffc">${entered} of ${total} guests entered (${pct}%)</small>`
+    : `<h2>Welcome to ${escapeHtml(APP_NAME)}</h2>
+       <p>${isOwner() ? 'Create your first event to start issuing tickets.' : 'Ask the workspace owner to create an event.'}</p>`;
+
+  $('#hT').textContent = total;
+  $('#hI').textContent = entered;
+  $('#hR').textContent = total - entered;
+  $('#newev').hidden = !isOwner();
+
+  $('#elist').innerHTML =
+    events.map((x) => `<div class="rc"><div><b>${escapeHtml(x.name)}</b><small>${escapeHtml(formatDate(x.date))}</small></div>
+      <button class="btn ghost sm" data-e="${escapeHtml(x.id)}">${x.id === currentEventId ? 'Selected' : 'Open'}</button></div>`).join('')
+    || '<p class="note">No events yet.</p>';
+
+  $('#recent').innerHTML =
+    tickets.slice(0, 6).map((t) => `<div class="rc"><div><b>${escapeHtml(t.name)}</b><small>${shortCode(t.id)}</small></div>
+      <span class="pill ${t.used ? 'in' : 'out'}">${t.used ? 'Entered' : 'Waiting'}</span></div>`).join('')
+    || '<p class="note">No tickets yet.</p>';
+
+  renderGuestTable();
+  renderAccount();
+}
+
+function renderGuestTable() {
+  const filter = $('#s').value.trim().toLowerCase();
+  const matches = tickets.filter((t) => {
+    if (!filter) return true;
+    return `${t.name} ${t.phone} ${t.email} ${shortCode(t.id)}`.toLowerCase().includes(filter);
+  });
+  $('#rows').innerHTML =
+    matches.map((t) => `<tr><td>${escapeHtml(t.name)}</td><td>${escapeHtml(t.phone)}</td><td>${escapeHtml(t.email)}</td>
+      <td>${shortCode(t.id)}</td>
+      <td><span class="pill ${t.used ? 'in' : 'out'}">${t.used ? 'Entered ' + escapeHtml(formatDate(t.usedAt)) : 'Not entered'}</span></td>
+      <td><button class="btn ghost sm" data-id="${escapeHtml(t.id)}">QR</button></td></tr>`).join('')
+    || '<tr><td colspan="6" class="note">No tickets yet.</td></tr>';
+}
+$('#s').oninput = renderGuestTable;
+$('#rows').onclick = (e) => {
+  const btn = e.target.closest('[data-id]');
+  if (!btn) return;
+  const ticket = tickets.find((t) => t.id === btn.dataset.id);
+  if (!ticket) return;
+  showTab('issue');
+  $('#out').innerHTML = '';
+  $('#out').appendChild(buildTicketCard(ticket));
+};
+
+function renderAccount() {
+  if (!profile || !org) return;
+  const plan = currentPlan();
+  $('#wk').innerHTML =
+    `<div class="rc"><div><b>${escapeHtml(org.name)}</b><small>Your role: ${escapeHtml(profile.role)}</small></div>
+     <span class="pill in">${plan.name} plan</span></div>
+     <p class="note" style="margin:8px 0">Events: ${events.length} of ${plan.maxEvents} · Tickets per event: ${plan.maxTickets}</p>` +
+    (isOwner() && org.plan === 'free' ? `<a class="btn sm" href="${UPGRADE_URL}">Upgrade to Pro</a>` : '');
+
+  $('#tm').hidden = !isOwner();
+  if (!isOwner()) return;
+
+  const members = team.map((m) => `<div class="rc"><div><b>${escapeHtml(m.name || m.email)}</b>
+      <small>${escapeHtml(m.email)} · ${escapeHtml(m.role)}</small></div>
+      ${m.id !== user.uid ? `<button class="btn ghost sm" data-rm="users/${escapeHtml(m.id)}">Remove</button>` : ''}</div>`);
+  const pending = invites.map((i) => `<div class="rc"><div><b>${escapeHtml(i.id)}</b><small>Invited, waiting to sign up</small></div>
+      <button class="btn ghost sm" data-rm="invites/${escapeHtml(i.id)}">Cancel</button></div>`);
+  $('#mem').innerHTML = members.concat(pending).join('');
+}
+
+$('#mem').onclick = (e) => {
+  const btn = e.target.closest('[data-rm]');
+  if (btn && confirm('Remove this person from your workspace?')) {
+    db.deleteDoc(btn.dataset.rm).catch((err) => showToast(err.message));
+  }
+};
+
+$('#inv').onclick = () => {
+  const email = $('#ie').value.trim().toLowerCase();
+  if (!isValidEmail(email)) return showToast('Enter a valid email.');
+  db.setDoc('invites/' + email, { orgId: profile.orgId, role: 'staff', by: user.email, createdAt: Date.now() })
+    .then(() => ($('#ie').value = ''))
+    .catch((err) => showToast(err.message));
+};
+
+
+// ============================================================
+// Events
+// ============================================================
+$('#mk').onclick = async () => {
+  const name = $('#en').value.trim();
+  if (!name) return showToast('Give the event a name.');
+  const plan = currentPlan();
+  if (events.length >= plan.maxEvents) {
+    return showToast(`The ${plan.name} plan allows ${plan.maxEvents} event(s). Upgrade in Account.`);
+  }
+  const id = randomId(10);
+  const dateValue = $('#ed').value;
+  try {
+    await db.setDoc(`orgs/${profile.orgId}/events/${id}`, {
+      name,
+      date: dateValue ? new Date(dateValue).getTime() : 0,
+      venue: $('#ev2').value.trim(),
+      color: $('#ec').value,
+      createdAt: Date.now(),
+    });
+    selectEvent(id);
+    $('#en').value = $('#ev2').value = $('#ed').value = '';
+  } catch (e) {
+    showToast(e.message);
+  }
+};
+
+
+// ============================================================
+// Tickets: QR drawing and issuing
+// ============================================================
+function drawQr(text, size) {
+  const qr = qrcode(0, 'M');
+  qr.addData(text);
+  qr.make();
+  const count = qr.getModuleCount();
+  const quiet = 4;   // blank border the QR spec asks for, scanners need it
+  const cell = Math.max(2, Math.floor(size / (count + 2 * quiet)));
+  const px = cell * (count + 2 * quiet);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = px;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, px, px);
+  ctx.fillStyle = '#000';
+  for (let r = 0; r < count; r++) {
+    for (let c = 0; c < count; c++) {
+      if (qr.isDark(r, c)) ctx.fillRect((c + quiet) * cell, (r + quiet) * cell, cell, cell);
+    }
+  }
+  return canvas;
+}
+
+// shrinks the font until the text fits, but not below 14px
+function drawFittedText(ctx, text, x, y, maxWidth, startSize, weight) {
+  let size = startSize;
+  do {
+    ctx.font = `${weight} ${size}px "Plus Jakarta Sans",system-ui,sans-serif`;
+    size -= 2;
+  } while (size > 14 && ctx.measureText(text).width > maxWidth);
+  ctx.fillText(text, x, y);
+}
+
+function drawTicket(ticket, ev) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1400;
+  canvas.height = 460;
+  const ctx = canvas.getContext('2d');
+
+  const grad = ctx.createLinearGradient(0, 0, 980, 460);
+  grad.addColorStop(0, ev.color || '#2447e0');
+  grad.addColorStop(1, '#111827');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 1400, 460);
+  ctx.fillStyle = '#ffffff1a';
+  ctx.beginPath();
+  ctx.arc(80, 470, 240, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#fff';
+  ctx.globalAlpha = 0.75;
+  ctx.font = '600 22px system-ui,sans-serif';
+  ctx.fillText('ADMIT ONE', 60, 70);
+
+  ctx.globalAlpha = 1;
+  drawFittedText(ctx, ev.name, 60, 150, 860, 68, '800');
+  ctx.globalAlpha = 0.85;
+  drawFittedText(ctx, eventMeta(ev).join('  |  '), 60, 200, 860, 28, '500');
+  ctx.globalAlpha = 0.65;
+  ctx.font = '600 20px system-ui,sans-serif';
+  ctx.fillText('GUEST', 60, 300);
+
+  ctx.globalAlpha = 1;
+  drawFittedText(ctx, ticket.name, 60, 350, 860, 44, '700');
+  drawFittedText(ctx, ticket.phone + '  ' + ticket.email, 60, 392, 860, 24, '500');
+
+  // white stub on the right so the QR scans no matter what colour the ticket is
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(980, 0, 420, 460);
+  ctx.drawImage(drawQr(`GW:${profile.orgId}:${ev.id}:${ticket.id}`, 600), 1010, 30, 360, 360);
+  ctx.fillStyle = '#14141a';
+  ctx.textAlign = 'center';
+  ctx.font = '700 26px ui-monospace,Menlo,monospace';
+  ctx.fillText(shortCode(ticket.id), 1190, 425);
+  ctx.font = '600 13px system-ui,sans-serif';
+  ctx.fillText('ONE TIME USE', 1190, 447);
+  return canvas;
+}
+
+function buildTicketCard(ticket, ev = currentEvent()) {
+  const canvas = drawTicket(ticket, ev);
+  const card = document.createElement('div');
+  card.className = 'card tk';
+  card.appendChild(canvas);
+  card.insertAdjacentHTML('beforeend',
+    `<small style="margin-bottom:8px">${escapeHtml(ticket.name)} · ${shortCode(ticket.id)}</small>`);
+
+  const btn = document.createElement('button');
+  btn.className = 'btn';
+  btn.textContent = 'Download ticket';
+  btn.onclick = () => {
+    canvas.toBlob((blob) => {
+      if (blob) saveFile(blob, `ticket-${ticket.name.replace(/\W+/g, '-')}-${shortCode(ticket.id)}.png`);
+    });
+  };
+  card.appendChild(btn);
+  return card;
+}
+
+// quick-and-dirty fill from a pasted chat message: grab the email, then the phone,
+// and treat whatever words are left as the name
+$('#ai').onclick = () => {
+  const text = $('#aiT').value;
+  const email = text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+  let rest = text.replace(email ? email[0] : '', ' ');
+  const phone = rest.match(/(?:\+?\d[\s-]?){8,14}/);
+  if (phone) rest = rest.replace(phone[0], ' ');
+
+  if (email) $('#e').value = email[0];
+  if (phone) $('#p').value = phone[0].trim();
+
+  const name = rest
+    .replace(/\b(hi|hello|my|name|is|this|phone|email|mail|number|no|tickets?)\b/ig, ' ')
+    .replace(/[^\p{L}\s'.-]/gu, ' ')   // keep any alphabet, not just A-Z
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (name) $('#n').value = name.split(' ').slice(0, 3).join(' ');
+};
+
+$('#mkt').onclick = async function () {
+  const errorBox = $('#iErr');
+  const name = $('#n').value.trim();
+  const phone = $('#p').value.trim();
+  const email = $('#e').value.trim();
+  const qty = Math.max(1, Math.min(20, parseInt($('#q').value, 10) || 1));
+  errorBox.textContent = '';
+
+  const ev = currentEvent();
+  if (!ev) { errorBox.textContent = 'Create or select an event first.'; return; }
+  if (!name || phone.replace(/\D/g, '').length < 7 || !isValidEmail(email)) {
+    errorBox.textContent = 'Enter a name, a valid phone number and a valid email.';
+    return;
+  }
+  const plan = currentPlan();
+  if (tickets.length + qty > plan.maxTickets) {
+    errorBox.textContent = `The ${plan.name} plan allows ${plan.maxTickets} tickets per event. Upgrade in Account.`;
+    return;
+  }
+
+  // remember the event and path now, in case the user switches events mid-loop
+  const path = ticketsPath();
+  const btn = this;
+  btn.disabled = true;
+  $('#out').innerHTML = '';
+  try {
+    for (let i = 0; i < qty; i++) {
+      const ticket = { name, phone, email, createdAt: Date.now(), used: false };
+      const id = randomId(14);
+      await db.setDoc(`${path}/${id}`, ticket);
+      ticket.id = id;
+      $('#out').appendChild(buildTicketCard(ticket, ev));
+    }
+    $('#n').value = $('#p').value = $('#e').value = '';
+    $('#q').value = 1;
+  } catch (e) {
+    errorBox.textContent = 'Could not save: ' + (e.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+$('#csv').onclick = () => {
+  const quote = (v) => {
+    let s = String(v == null ? '' : v);
+    // a leading = + - @ makes Excel treat the cell as a formula, so defuse it
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+  };
+  const rows = [['Code', 'Name', 'Phone', 'Email', 'Created', 'Entered']].concat(
+    tickets.map((t) => [shortCode(t.id), t.name, t.phone, t.email, formatDate(t.createdAt), t.used ? formatDate(t.usedAt) : ''])
+  );
+  const csv = rows.map((r) => r.map(quote).join(',')).join('\n');
+  const ev = currentEvent();
+  // the BOM at the front lets Excel read non-English names properly
+  saveFile(new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' }),
+    (ev ? ev.name : 'guests').replace(/\W+/g, '-') + '.csv');
+};
+
+
+// ============================================================
+// Scanning
+// ============================================================
+let cameraStream = null;
+let cameraStarting = false;
+let frameRequest = 0;
+let lastScan = { code: '', time: 0 };
+let frameCanvas = null;
+
+function showScanResult(kind, heading, detail) {
+  $('#res').innerHTML = `<div class="res ${kind}"><h2>${heading}</h2><p>${escapeHtml(detail)}</p></div>`;
+  try { navigator.vibrate && navigator.vibrate(kind === 'ok' ? 80 : [120, 60, 120]); } catch (e) { /* no vibration support */ }
+}
+
+// QR payload looks like GW:<orgId>:<eventId>:<ticketId>
+async function checkTicket(raw) {
+  const m = String(raw).trim().match(/^GW:(\w+):(\w+):([a-z0-9]{6,20})$/i);
+  if (!m) return showScanResult('er', 'INVALID', `This is not a ${APP_NAME} ticket.`);
+
+  const [, orgId, eventId, ticketId] = m;
+  if (orgId !== profile.orgId) return showScanResult('er', 'NOT YOURS', 'This ticket belongs to a different organiser.');
+  if (eventId !== currentEventId) {
+    const other = events.find((x) => x.id === eventId);
+    return showScanResult('wn', 'WRONG EVENT', other
+      ? `This ticket is for "${other.name}". Switch event at the top.`
+      : 'This ticket is for an event that no longer exists.');
+  }
+
+  try {
+    const res = await db.claimTicket(`orgs/${orgId}/events/${eventId}/tickets/${ticketId.toLowerCase()}`);
+    if (res.status === 'missing') return showScanResult('er', 'INVALID', 'Not found in the system.');
+    if (res.status === 'used') return showScanResult('wn', 'ALREADY USED', `${res.data.name} entered at ${formatDate(res.data.usedAt)}`);
+    showScanResult('ok', 'VALID: LET IN', `${res.data.name} · ${res.data.phone}`);
+  } catch (e) {
+    showScanResult('er', 'ERROR', 'Could not check: ' + (e.message || e));
+  }
+}
+
+// fallback for when the camera isn't working: type the 6-character code
+$('#chk').onclick = () => {
+  const code = $('#man').value.trim().toUpperCase();
+  if (!code) return;
+  const ticket = tickets.find((t) => shortCode(t.id) === code);
+  $('#man').value = '';
+  if (ticket) checkTicket(`GW:${profile.orgId}:${currentEventId}:${ticket.id}`);
+  else showScanResult('er', 'NOT FOUND', `No ticket with code ${code} in this event.`);
+};
+
+async function startCamera() {
+  if (cameraStream || cameraStarting) return;   // already running, don't open a second stream
+  cameraStarting = true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    // user may have left the scan tab while the permission prompt was open
+    if ($('#scan').hidden) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    cameraStream = stream;
+    const video = $('#v');
+    video.srcObject = stream;
+    video.hidden = false;
+    await video.play();
+    $('#cam').hidden = true;
+    $('#stop').hidden = false;
+    scanFrame();
+  } catch (e) {
+    stopCamera();
+    showToast('Camera is blocked. Allow camera access, or type the ticket code below.');
+  } finally {
+    cameraStarting = false;
+  }
+}
+
+function scanFrame() {
+  const video = $('#v');
+  if (!cameraStream) return;
+
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    frameCanvas = frameCanvas || document.createElement('canvas');
+    const ctx = frameCanvas.getContext('2d', { willReadFrequently: true });
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    frameCanvas.width = w;
+    frameCanvas.height = h;
+    ctx.drawImage(video, 0, 0);
+    // our tickets are always dark-on-light, so skip the slower inverted pass
+    const code = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: 'dontInvert' });
+
+    // ignore the same code for 4s so a ticket held in view isn't checked over and over
+    if (code && code.data && (code.data !== lastScan.code || Date.now() - lastScan.time > 4000)) {
+      lastScan = { code: code.data, time: Date.now() };
+      checkTicket(code.data);
+    }
+  }
+  frameRequest = requestAnimationFrame(scanFrame);
+}
+
+function stopCamera() {
+  cancelAnimationFrame(frameRequest);
+  if (cameraStream) {
+    cameraStream.getTracks().forEach((t) => t.stop());
+    cameraStream = null;
+  }
+  const video = $('#v');
+  video.pause();
+  video.srcObject = null;
+  video.hidden = true;
+  $('#cam').hidden = false;
+  $('#stop').hidden = true;
+}
+$('#cam').onclick = startCamera;
+$('#stop').onclick = stopCamera;
+
+
+// ============================================================
+// Start up
+// This has to stay at the very bottom. In demo mode the callback
+// fires straight away and needs everything above to exist already
+// (stopCamera uses variables declared in the Scanning section).
+// ============================================================
+db.onAuthChange((authUser) => {
+  loadId++;
+  clearSubscriptions();
+  stopCamera();
+  if (!authUser) {
+    profile = org = user = null;
+    $('#auth').hidden = false;
+    $('#app').hidden = true;
+    $('#demo').hidden = isLive;
+    return;
+  }
+  loadWorkspace(authUser);
+});
